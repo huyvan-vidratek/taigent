@@ -6,6 +6,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { parseArgs, parseEnv } from 'node:util';
 import { AdoptError, adoptItem, type AdoptParent } from './adopt.ts';
 import { describeBootstrapOperation, executeBootstrap, planBootstrap, readBootstrapRemote } from './bootstrap.ts';
+import { parseDay } from './days.ts';
 import { ManifestChangedError, readManifestFile } from './edit.ts';
 import { ExitCode } from './exit-codes.ts';
 import { describeAppliedOperation, executePlan } from './executor.ts';
@@ -19,6 +20,12 @@ import { listProjectSlugs, loadManifests, type LoadedProject } from './manifest/
 import { initRepository, InitError, type InitStatus } from './init.ts';
 import { LOGIN_HINT, LoginError, normalizeApiUrl, removeLogin, StoredSession, storeLogin } from './login.ts';
 import { serveMcp, startProxy } from './mcp.ts';
+import { readBacklogData } from './metrics/backlog.ts';
+import { computeMetrics } from './metrics/compute.ts';
+import { HistoryCacheError } from './metrics/history.ts';
+import { readReleases } from './metrics/releases.ts';
+import { ProjectNotFoundError, readSnapshot as readMetricsSnapshot } from './metrics/snapshot.ts';
+import { formatMetricsText } from './metrics/text.ts';
 import type { Action, PlanSummary, Result } from './operations.ts';
 import {
   buildPlan,
@@ -43,7 +50,7 @@ import { Secrets } from './secrets.ts';
 import { compareSkills, SKILLS_SOURCE, SKILLS_TARGET, SkillsSourceMissingError, syncSkills } from './skills.ts';
 import { TaigaAuthError, type TaigaAuthorizer, TaigaClient, TaigaConflictError, TaigaError } from './taiga/client.ts';
 import { commentTicket, parseRef, setTicketStatus, TicketError } from './ticket.ts';
-import { dayRange, formatTicketsText, parseDay, readTickets } from './tickets.ts';
+import { dayRange, formatTicketsText, readTickets } from './tickets.ts';
 import { describeUploadOperation, executeUpload, planUpload, readUploadRemote, UploadTooLargeError } from './upload.ts';
 
 const USAGE = `Usage: taigent <command> [--project <slug>] [options]
@@ -70,6 +77,11 @@ Commands:
             stories in no sprint (read-only)
   snapshot  Read every epic and every open story, task and issue of --project, hand-made ones too, with their full
             descriptions, into <manifests>/<slug>/snapshot.json (git-ignored; read-only on Taiga)
+  metrics   Dashboard metrics of --project for every Role, from what Taiga holds now and the history of each item:
+            per period (sprint, or week on a kanban project) throughput, lead time, cycle time, workload, blocked and
+            overdue work; release burndown with the releases of project.yaml (read-only)
+            Business Analyst: stories by status, and from backlog.yaml and review.yaml complete acceptance
+            criteria, requirements coverage, items awaiting review or pending clarification
   status <ref> <status>   Move your ticket #<ref> of --project to that status, e.g. \`status 84 Done\` (writes at once)
   comment <ref> <text>    Add a comment to your ticket #<ref> of --project (writes at once)
   notify week|day|eod     Send your tickets of the week, of the day, or those still open and due by today to your
@@ -90,6 +102,8 @@ Options:
   --epic <KEY>, --story <KEY>  adopt: the manifest parent of a user story (an epic) or of a task (a story)
   --keep-manifest   pull: leave backlog.yaml as it is and only set the baseline to Taiga's values
   --out <file>      preview: write the page (or the JSON) to this file instead of stdout
+  --cache-dir <dir> metrics: keep the history of each item in this directory and read it again only for items
+                    changed since (default: read every history, write nothing)
   --application <id>  login: store an application token of this Application (created by the instance admin)
                     instead of a refresh token
   --json            Machine-readable output on stdout
@@ -109,16 +123,17 @@ Environment (a variable not set in the environment is read from ./.env):
                                    directory, for machines without an OS credential store)
   TAIGENT_CONFIG_DIR               Config directory of the stored login (default: per-user, e.g. %APPDATA%\\taigent)
   TAIGENT_READ_ONLY                1: refuse every write to Taiga (apply/upload/bootstrap --yes, status, comment) with
-                                   exit 2; plan, preview, validate and --dry-run still work (Taigent Desktop's headless runs)
+                                   exit 2; plan, preview, validate, metrics and --dry-run still work (Taigent Desktop's headless runs)
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  notify: the bot and your chat; default: the Claude Code Telegram plugin's
                                    .env and its single paired user (access.json) in TELEGRAM_STATE_DIR
                                    (default: <CLAUDE_CONFIG_DIR or ~/.claude>/channels/telegram)
 
 Exit codes: 0 ok/no changes, 1 internal error, 2 usage/config error (incl. changes without --yes, not logged in,
-            a write under TAIGENT_READ_ONLY), 3 plan/--dry-run/skills check has changes, 4 manifest invalid (pull:
-            Taiga's values do not fit the manifest), 5 Taiga/network error, 6 plan/apply has blocked items`;
+            a write under TAIGENT_READ_ONLY, metrics of an unknown project), 3 plan/--dry-run/skills check has changes,
+            4 manifest invalid (pull: Taiga's values do not fit the manifest), 5 Taiga/network error, 6 plan/apply has
+            blocked items`;
 
-const COMMANDS = ['init', 'validate', 'preview', 'bootstrap', 'plan', 'apply', 'adopt', 'pull', 'upload', 'tickets', 'projects', 'report', 'snapshot', 'status', 'comment', 'notify', 'skills', 'login', 'logout', 'whoami', 'mcp'] as const;
+const COMMANDS = ['init', 'validate', 'preview', 'bootstrap', 'plan', 'apply', 'adopt', 'pull', 'upload', 'tickets', 'projects', 'report', 'snapshot', 'metrics', 'status', 'comment', 'notify', 'skills', 'login', 'logout', 'whoami', 'mcp'] as const;
 /** Commands that work without --project. */
 const PROJECTLESS: readonly Command[] = ['init', 'validate', 'skills', 'tickets', 'projects', 'notify', 'login', 'logout', 'whoami', 'mcp'];
 
@@ -189,6 +204,8 @@ interface Options {
   application?: string;
   /** `preview`: file to write instead of stdout. */
   out?: string;
+  /** `metrics`: directory of the history cache. */
+  cacheDir?: string;
   json: boolean;
   yes: boolean;
   dryRun: boolean;
@@ -228,6 +245,7 @@ function parseOptions(argv: string[]): Options | 'help' {
         epic: { type: 'string' },
         story: { type: 'string' },
         'keep-manifest': { type: 'boolean', default: false },
+        'cache-dir': { type: 'string' },
         json: { type: 'boolean', default: false },
         yes: { type: 'boolean', default: false },
         'dry-run': { type: 'boolean', default: false },
@@ -297,6 +315,8 @@ function parseOptions(argv: string[]): Options | 'help' {
   if (values.application === '') throw new UsageError('--application needs the Application id');
   if (values.out !== undefined && command !== 'preview') throw new UsageError('--out applies only to preview');
   if (values.out === '') throw new UsageError('--out needs a file path');
+  if (values['cache-dir'] !== undefined && command !== 'metrics') throw new UsageError('--cache-dir applies only to metrics');
+  if (values['cache-dir'] === '') throw new UsageError('--cache-dir needs a directory');
   if (command === 'tickets') {
     for (const name of ['from', 'to'] as const) {
       const value = values[name];
@@ -321,6 +341,7 @@ function parseOptions(argv: string[]): Options | 'help' {
     notifyKind,
     application: values.application,
     out: values.out,
+    cacheDir: values['cache-dir'],
     json: values.json,
     yes: values.yes,
     dryRun: values['dry-run'],
@@ -808,6 +829,23 @@ async function runSnapshot(run: Run): Promise<number> {
   return ExitCode.Ok;
 }
 
+/**
+ * `metrics`: the dashboards' metrics of the project, from one read of Taiga (with each item's history, kept in
+ * --cache-dir when given) and its manifests. Read-only on Taiga.
+ */
+async function runMetrics(run: Run): Promise<number> {
+  const { options, env, cwd } = run;
+  const slug = options.project!;
+  const { dir } = projectLayout(slug, env, cwd);
+  const releases = await readReleases(dir, slug);
+  const cacheDir = options.cacheDir === undefined ? undefined : resolve(cwd, options.cacheDir);
+  const snapshot = await readMetricsSnapshot(await connectTaiga(run), slug, cacheDir);
+  const backlog = await readBacklogData(dir, slug);
+  const report = computeMetrics(snapshot, { releases, backlog }, new Date());
+  emit(run, report, () => formatMetricsText(report));
+  return ExitCode.Ok;
+}
+
 /** `status`: move one of the user's tickets to a status, at once (the request is the confirmation). */
 async function runStatus(run: Run): Promise<number> {
   const { options } = run;
@@ -965,6 +1003,8 @@ function dispatch(run: Run): Promise<number> {
       return runReport(run);
     case 'snapshot':
       return runSnapshot(run);
+    case 'metrics':
+      return runMetrics(run);
     case 'status':
       return runStatus(run);
     case 'comment':
@@ -1035,10 +1075,12 @@ export async function main(argv: string[], processEnv: NodeJS.ProcessEnv = proce
     if (error instanceof LoginError) return fail(secrets, ExitCode.Usage, 'login', error, json);
     if (error instanceof ReadOnlyError) return fail(secrets, ExitCode.Usage, 'read-only', error, json);
     if (error instanceof PromptCancelled) return fail(secrets, ExitCode.Usage, 'usage', new UsageError('login cancelled'), json);
+    if (error instanceof ProjectNotFoundError) return fail(secrets, ExitCode.Usage, 'project', error, json);
     if (
       error instanceof TicketError ||
       error instanceof NotifyConfigError ||
       error instanceof InitError ||
+      error instanceof HistoryCacheError ||
       error instanceof AdoptError ||
       error instanceof PullKeyError ||
       error instanceof ManifestChangedError

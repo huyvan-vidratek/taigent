@@ -19,7 +19,7 @@ import {
   type ManifestItem,
   type SnapshotItems,
 } from './managed.ts';
-import { type AttributeValue, type Backlog, BACKLOG_FILE, backlogKeys, type StorySpec } from './manifest/backlog.ts';
+import { type AttributeValue, type Backlog, BACKLOG_FILE, backlogKeys, type Scenario, type StorySpec } from './manifest/backlog.ts';
 import { checkKeyReference, KEY_PATTERN } from './manifest/conventions.ts';
 import { ManifestError, type ManifestIssue } from './manifest/errors.ts';
 import { SNAPSHOT_FILE } from './manifest/layout.ts';
@@ -288,6 +288,8 @@ export interface PreviewStory extends PreviewItem {
   type: 'story';
   /** `legacy` stories are only allowed when already on Taiga; plan/apply refuse to create them. */
   format: StorySpec['format'];
+  /** The story's Gherkin scenarios, as in the manifest; none for a `legacy` story. */
+  scenarios: Scenario[];
   spec: string;
   tasks: PreviewItem[];
 }
@@ -440,7 +442,7 @@ export async function buildPreview(dir: string, slug: string): Promise<Preview> 
         summary.tasks++;
         return previewItem({ type: 'task', item: task, story: story.key }, task.description, { parent: story.key });
       });
-      return { ...storyItem, format: story.format, spec: story.spec, tasks };
+      return { ...storyItem, format: story.format, scenarios: story.format === 'user-story' ? story.scenarios : [], spec: story.spec, tasks };
     });
     return { ...item, stories };
   });

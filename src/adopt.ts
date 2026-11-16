@@ -1,5 +1,5 @@
 // Adopt: writes a hand-made Taiga item (no `src:` tag) into backlog.yaml as a backlog item with its `ref`, so that
-// plan proposes the `adopt` action and apply adds its `src:<key>` tag (ADR 0004). Reads Taiga, writes only local
+// plan proposes the `adopt` action and apply adds its `src:<key>` tag (ADR 0006). Reads Taiga, writes only local
 // files: the manifest, through the manifest edit API (comments and layout of the file stay), and the Taiga values it
 // copied as the item's baseline under `adopted` in state.json, so that plan blocks the adopt when Taiga changes before
 // apply. Content is copied verbatim: subject, description, the tags with a prefix the manifest allows, an issue's

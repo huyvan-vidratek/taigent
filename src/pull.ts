@@ -1,5 +1,5 @@
 // Pull: brings Taiga's managed values of backlog items into backlog.yaml and records them as the items' baseline in
-// state.json, so a remote edit stops blocking plan (ADR 0004: Taiga is the truth, the manifest a draft of changes not
+// state.json, so a remote edit stops blocking plan (ADR 0006: Taiga is the truth, the manifest a draft of changes not
 // applied yet). Reads Taiga through the plan, writes only local files. A story keeps its format: its description is
 // parsed back from the story template, and one that does not parse changes no file. `keepManifest` only moves the
 // baseline to Taiga's values, so the next plan proposes writing the manifest's values: the way to settle a both-edited
