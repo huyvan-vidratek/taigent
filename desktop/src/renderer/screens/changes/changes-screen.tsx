@@ -7,7 +7,7 @@ import { type ReactNode, useEffect, useState } from 'react';
 import { TriangleAlert } from 'lucide-react';
 import type { ApplyOutcome, Plan, PreviewItem } from '../../../shared/api.ts';
 import { withBusy, toast } from '@/actions.ts';
-import { Code, PageHeader, ScreenBody, StatCell, StatusBadge, TableSkeleton, TYPE_LABEL } from '@/components/common.tsx';
+import { BLOCKED_LABEL, Code, OriginCells, PageHeader, ScreenBody, StatCell, StatusBadge, TableSkeleton, TYPE_LABEL } from '@/components/common.tsx';
 import { FailureBlock } from '@/components/failure-block.tsx';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert.tsx';
 import { Button } from '@/components/ui/button.tsx';
@@ -21,10 +21,17 @@ import { api, useApp, visibleNodes } from '@/store.ts';
 /** What the result region shows: nothing, a note while a run goes, or the outcome of a run for project `slug`. */
 type ChangesResult = { note?: string } | { slug: string; title: string; time: string; content: ReactNode };
 
-const ACTION: Record<string, string> = { create: 'Tạo mới', update: 'Cập nhật', link: 'Gắn vào epic' };
-const RESULT: Record<string, string> = { created: 'Đã tạo', updated: 'Đã cập nhật', linked: 'Đã gắn', unchanged: 'Không đổi' };
+const ACTION: Record<string, string> = { create: 'Tạo mới', update: 'Cập nhật', adopt: 'Adopt', link: 'Gắn vào epic' };
+const RESULT: Record<string, string> = { created: 'Đã tạo', updated: 'Đã cập nhật', adopted: 'Đã adopt', linked: 'Đã gắn', unchanged: 'Không đổi' };
+const BLOCKED_TITLE = 'Có mục bị chặn, chưa thể đẩy lên Taiga';
 
 const typeLabel = (type: string) => TYPE_LABEL[type as PreviewItem['type']] ?? type;
+
+/** The subject of each item of the open project by key, for plan rows that carry none. */
+function subjectsOf(): Map<string, string> {
+  const open = useApp.getState().view;
+  return new Map(open ? visibleNodes(open, 'all').map((node) => [node.item.key, node.item.subject]) : []);
+}
 
 function Overview() {
   const view = useApp((s) => s.view);
@@ -49,8 +56,7 @@ function Overview() {
         <StatCell label="Task" value={s.tasks} />
         <StatCell label="Issue" value={s.issues} />
         {sep}
-        <StatCell label="Mới" value={s.new} tone="new" />
-        <StatCell label="Đã đẩy" value={s.applied} tone="applied" />
+        <OriginCells view={view} />
         {sep}
         <StatCell label="Đạt" value={s.approved} tone="approved" />
         <StatCell label="Cần sửa" value={s.changes} tone="changes" />
@@ -83,15 +89,33 @@ function WarnBox({ id, title, children }: { id?: string; title: string; children
   );
 }
 
-/** What `taigent plan` would write, the Taiga items no longer in the backlog, and the stale epic links. */
+/** What `taigent plan` would write, the items it blocks, the Taiga items no longer in the backlog, and the stale epic links. */
 function PlanTable({ plan, subjects }: { plan: Plan; subjects: Map<string, string> }) {
   const operations = plan.operations.filter((operation) => operation.action !== 'skip');
   return (
     <div className="flex flex-col gap-3">
       <p>
-        Tạo mới {plan.summary.create} · Cập nhật {plan.summary.update} · Gắn epic {plan.summary.link} · Không đổi {plan.summary.skip}
+        Tạo mới {plan.summary.create} · Cập nhật {plan.summary.update} · Adopt {plan.summary.adopt} · Gắn epic {plan.summary.link} · Không đổi{' '}
+        {plan.summary.skip}
       </p>
-      {operations.length === 0 && <p>Không có thay đổi nào cần đẩy.</p>}
+      {plan.blocked.length > 0 && (
+        <WarnBox id="plan-blocked" title={`${plan.blocked.length} mục bị chặn: đẩy lên Taiga không ghi gì cho tới khi backlog.yaml xử lý chúng.`}>
+          <p>Nhờ agent xử lý (skill taiga-plan-backlog): lấy giá trị trên Taiga (taigent pull) hoặc gộp hai bên trong backlog.yaml, rồi xem lại thay đổi.</p>
+          <ul className="list-disc space-y-1 pl-4">
+            {plan.blocked.map((item) => (
+              <li key={`${item.type}-${item.key}`} className={`blocked-${item.kind}`} title={BLOCKED_LABEL[item.kind].hint}>
+                <StatusBadge tone={item.kind} className="remote">
+                  {BLOCKED_LABEL[item.kind].label}
+                </StatusBadge>
+                {` ${typeLabel(item.type)} #${item.ref} `}
+                <Code>{item.key}</Code>
+                {`: ${Object.keys(item.fields).join(', ')}`}
+              </li>
+            ))}
+          </ul>
+        </WarnBox>
+      )}
+      {operations.length === 0 && plan.blocked.length === 0 && <p>Không có thay đổi nào cần đẩy.</p>}
       {operations.length > 0 && (
         <div className="-mx-6">
           <Table className="plan">
@@ -112,7 +136,7 @@ function PlanTable({ plan, subjects }: { plan: Plan; subjects: Map<string, strin
                     <Code>{operation.key}</Code> {operation.fields?.subject ?? subjects.get(operation.key) ?? ''}
                   </TableCell>
                   <TableCell className="whitespace-normal text-muted-foreground">
-                    {operation.action === 'update'
+                    {operation.action === 'update' || operation.action === 'adopt'
                       ? `Đổi: ${Object.keys(operation.changes ?? {}).join(', ')}${operation.ref ? ` (#${operation.ref})` : ''}`
                       : operation.action === 'link'
                         ? `→ ${operation.epic}`
@@ -157,7 +181,7 @@ function PlanTable({ plan, subjects }: { plan: Plan; subjects: Map<string, strin
   );
 }
 
-function ApplyContent({ outcome }: { outcome: Exclude<ApplyOutcome, { status: 'cancelled' | 'no-changes' }> }) {
+function ApplyContent({ outcome }: { outcome: Exclude<ApplyOutcome, { status: 'cancelled' | 'no-changes' | 'plan-blocked' }> }) {
   if (outcome.status === 'blocked') {
     return (
       <>
@@ -174,7 +198,8 @@ function ApplyContent({ outcome }: { outcome: Exclude<ApplyOutcome, { status: 'c
   return (
     <>
       <p>
-        Tạo {report.summary.created} · Cập nhật {report.summary.updated} · Gắn epic {report.summary.linked} · Không đổi {report.summary.unchanged}
+        Tạo {report.summary.created} · Cập nhật {report.summary.updated} · Adopt {report.summary.adopted} · Gắn epic {report.summary.linked} · Không
+        đổi {report.summary.unchanged}
       </p>
       <div className="-mx-6">
         <Table className="plan">
@@ -236,9 +261,8 @@ export function ChangesScreen() {
     run('plan', 'Đang chạy taigent plan…', async (slug) => {
       const planned = await api.plan(slug);
       if (!planned.ok) return show(slug, 'Xem thay đổi trên Taiga', <FailureBlock failure={planned} />);
-      const open = useApp.getState().view;
-      const subjects = new Map(open ? visibleNodes(open, 'all').map((node) => [node.item.key, node.item.subject]) : []);
-      show(slug, planned.value.changes ? 'Thay đổi sẽ ghi lên Taiga' : 'Taiga đã khớp với backlog', <PlanTable plan={planned.value} subjects={subjects} />);
+      const title = planned.value.blocked.length > 0 ? BLOCKED_TITLE : planned.value.changes ? 'Thay đổi sẽ ghi lên Taiga' : 'Taiga đã khớp với backlog';
+      show(slug, title, <PlanTable plan={planned.value} subjects={subjectsOf()} />);
     });
 
   const pushToTaiga = () =>
@@ -250,6 +274,7 @@ export function ChangesScreen() {
         toast('Đã huỷ, chưa ghi gì lên Taiga.');
         return show(slug, 'Đã huỷ đẩy lên Taiga', <p>Chưa ghi gì lên Taiga.</p>);
       }
+      if (outcome.status === 'plan-blocked') return show(slug, BLOCKED_TITLE, <PlanTable plan={outcome.plan} subjects={subjectsOf()} />);
       if (outcome.status === 'no-changes') return show(slug, 'Taiga đã khớp với backlog', <p>Không có thay đổi nào cần đẩy.</p>);
       show(slug, outcome.status === 'blocked' ? 'Chưa thể đẩy lên Taiga' : 'Đã đẩy lên Taiga', <ApplyContent outcome={outcome} />);
     });

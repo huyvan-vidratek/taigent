@@ -41,6 +41,8 @@ export interface ManifestFile {
  * manifest and an empty one (`''`, `[]`, `{}`) is removed from it.
  */
 export interface ItemFields {
+  /** Taiga ref of the hand-made item the backlog item adopts (`taigent adopt` sets it). */
+  ref?: number;
   subject?: string;
   description?: string;
   tags?: string[];
@@ -79,6 +81,12 @@ export interface SaveItemRequest {
   original?: string;
   /** The item after the edit: a key or parent different from the original renames or moves it. */
   item: BacklogItem;
+}
+
+/** Several item edits written at once: all of them, or none when one is invalid. */
+export interface SaveItemsRequest {
+  baseDigest: string;
+  items: Omit<SaveItemRequest, 'baseDigest'>[];
 }
 
 export interface RemoveItemRequest {
@@ -121,6 +129,12 @@ export type EditResult<T extends object> =
   | { status: 'conflict'; current: ManifestFile }
   | { status: 'invalid'; issues: ManifestIssue[] };
 
+/**
+ * A command (`adopt`, `pull`) read backlog.yaml before reading Taiga, and the file changed before it wrote it (a person
+ * or an agent edited it). Nothing was written; running the command again starts from the current file.
+ */
+export class ManifestChangedError extends Error {}
+
 interface ItemKind {
   /** The list that holds items of this kind, in their parent item (or at the top of the file). */
   list: string;
@@ -131,15 +145,15 @@ interface ItemKind {
 }
 
 const KINDS: Record<ItemType, ItemKind> = {
-  epic: { list: 'epics', child: 'story', order: ['key', 'subject', 'description', 'tags', 'custom_attributes', 'stories'] },
+  epic: { list: 'epics', child: 'story', order: ['key', 'ref', 'subject', 'description', 'tags', 'custom_attributes', 'stories'] },
   story: {
     list: 'stories',
     parent: 'epic',
     child: 'task',
-    order: ['key', 'subject', 'use_case', 'scenarios', 'acceptance_criteria', 'description', 'spec', 'tags', 'custom_attributes', 'tasks'],
+    order: ['key', 'ref', 'subject', 'use_case', 'scenarios', 'acceptance_criteria', 'description', 'spec', 'tags', 'custom_attributes', 'tasks'],
   },
-  task: { list: 'tasks', parent: 'story', order: ['key', 'subject', 'description', 'tags', 'custom_attributes'] },
-  issue: { list: 'issues', order: ['key', 'subject', 'description', 'type', 'severity', 'priority', 'tags', 'custom_attributes'] },
+  task: { list: 'tasks', parent: 'story', order: ['key', 'ref', 'subject', 'description', 'tags', 'custom_attributes'] },
+  issue: { list: 'issues', order: ['key', 'ref', 'subject', 'description', 'type', 'severity', 'priority', 'tags', 'custom_attributes'] },
 };
 
 /** Top-level fields of backlog.yaml and of docs.yaml, in order. */
@@ -154,6 +168,7 @@ const NOT_A_MAPPING: Record<EditableManifest, string> = {
 
 /** Manifest field name of each input field. */
 const FIELD_NAMES: Record<string, string> = {
+  ref: 'ref',
   subject: 'subject',
   description: 'description',
   tags: 'tags',
@@ -461,54 +476,67 @@ function underItem(path: string, at: string, type: ItemType): boolean {
  * `path` is where the item now is in the manifest.
  */
 export async function saveItem(dir: string, request: SaveItemRequest): Promise<EditResult<{ path: string }>> {
-  const { item, original } = request;
+  const saved = await saveItems(dir, { baseDigest: request.baseDigest, items: [request] });
+  return saved.status === 'saved' ? { status: 'saved', digest: saved.digest, path: saved.paths[0]! } : saved;
+}
+
+/**
+ * `saveItem` for several items, in order, written in one go: nothing is written when any of them is invalid. `paths`
+ * holds where each item now is in the manifest.
+ */
+export async function saveItems(dir: string, request: SaveItemsRequest): Promise<EditResult<{ paths: string[] }>> {
   const opened = await open(dir, 'backlog', request.baseDigest);
   if (!opened.ok) return opened.result;
   const { manifest, doc, root } = opened;
-  const all = entries(root);
-  const kind = KINDS[item.type];
-
-  const existing = original === undefined ? undefined : all.find((entry) => entry.type === item.type && entry.key === original);
-  if (original !== undefined && !existing) return missing(manifest.file, item.type, original);
   const issues: ManifestIssue[] = [];
   const issue: IssueSink = (path, rule, message) => issues.push({ file: manifest.file, path, rule, message });
-  if (existing) {
-    const state = await readState(join(dir, STATE_FILE), { id: 0, slug: '' });
-    const applied = new Set(Object.entries(state.items).flatMap(([key, recorded]) => (recorded.type === item.type ? [key] : [])));
-    checkKeyLocked(original!, item.key, `${existing.path}.key`, issue, applied);
-    if (issues.length > 0) return { status: 'invalid', issues };
-  }
-  const parentKey = 'parent' in item ? item.parent : undefined;
-  const parent = kind.parent && all.find((entry) => entry.type === kind.parent && entry.key === parentKey);
-  if (kind.parent && !parent) return missing(manifest.file, kind.parent, parentKey ?? '');
+  const state = await readState(join(dir, STATE_FILE), { id: 0, slug: '' });
+  const nodes: YAMLMap[] = [];
 
-  const node = existing?.node ?? doc.createNode({ key: item.key });
-  if (existing && item.key !== original) node.set('key', item.key);
-  applyFields(doc, node, item);
-  if (!existing || existing.parent?.key !== parentKey) {
-    if (existing) detach(existing);
-    append(doc, parent ? parent.node : root, parent ? KINDS[parent.type].order : ROOT_ORDER, item.type, node);
+  for (const { item, original } of request.items) {
+    const all = entries(root);
+    const kind = KINDS[item.type];
+    const existing = original === undefined ? undefined : all.find((entry) => entry.type === item.type && entry.key === original);
+    if (original !== undefined && !existing) return missing(manifest.file, item.type, original);
+    if (existing) {
+      const applied = new Set(Object.entries(state.items).flatMap(([key, recorded]) => (recorded.type === item.type ? [key] : [])));
+      checkKeyLocked(original!, item.key, `${existing.path}.key`, issue, applied);
+      if (issues.length > 0) return { status: 'invalid', issues };
+    }
+    const parentKey = 'parent' in item ? item.parent : undefined;
+    const parent = kind.parent && all.find((entry) => entry.type === kind.parent && entry.key === parentKey);
+    if (kind.parent && !parent) return missing(manifest.file, kind.parent, parentKey ?? '');
+
+    const node = existing?.node ?? doc.createNode({ key: item.key });
+    if (existing && item.key !== original) node.set('key', item.key);
+    applyFields(doc, node, item);
+    if (!existing || existing.parent?.key !== parentKey) {
+      if (existing) detach(existing);
+      append(doc, parent ? parent.node : root, parent ? KINDS[parent.type].order : ROOT_ORDER, item.type, node);
+    }
+    nodes.push(node);
   }
 
   const text = render(doc, manifest.text);
   const placed = entries(root);
-  const path = placed.find((entry) => entry.node === node)!.path;
+  const paths = nodes.map((node) => placed.find((entry) => entry.node === node)!.path);
   try {
     checkBacklog(parse(text), manifest.file);
   } catch (error) {
     if (!(error instanceof ManifestError)) throw error;
-    issues.push(...error.issues.filter((found) => underItem(found.path, path, item.type)));
+    issues.push(...error.issues.filter((found) => request.items.some(({ item }, i) => underItem(found.path, paths[i]!, item.type))));
   }
-  // The loader reports a duplicate key on its second use; the edited item may be the first one, so its key is
+  // The loader reports a duplicate key on its second use; an edited item may be the first one, so edited keys are
   // checked last, against every other key.
-  const keyPath = `${path}.key`;
   const seen = new Map<string, string>();
-  for (const entry of placed) if (entry.node !== node) checkKey(entry.key, `${entry.path}.key`, () => {}, seen);
-  checkKey(item.key, keyPath, (at, rule, message) => {
-    if (!issues.some((known) => known.path === at && known.rule === rule)) issue(at, rule, message);
-  }, seen);
+  for (const entry of placed) if (!nodes.includes(entry.node)) checkKey(entry.key, `${entry.path}.key`, () => {}, seen);
+  request.items.forEach(({ item }, i) => {
+    checkKey(item.key, `${paths[i]}.key`, (at, rule, message) => {
+      if (!issues.some((known) => known.path === at && known.rule === rule)) issue(at, rule, message);
+    }, seen);
+  });
   if (issues.length > 0) return { status: 'invalid', issues };
-  return exclusive(() => replace(manifest, text, { path }));
+  return exclusive(() => replace(manifest, text, { paths }));
 }
 
 /**

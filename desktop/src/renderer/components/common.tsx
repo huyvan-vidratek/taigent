@@ -3,10 +3,12 @@
 // elements because the smoke scripts (scripts/smoke*.mjs) select them.
 
 import type { ReactNode } from 'react';
-import type { PreviewItem } from '../../shared/api.ts';
+import type { PreviewItem, ProjectView } from '../../shared/api.ts';
 import { Badge } from '@/components/ui/badge.tsx';
+import { Separator } from '@/components/ui/separator.tsx';
 import { Skeleton } from '@/components/ui/skeleton.tsx';
 import { cn } from '@/lib/utils.ts';
+import { useApp } from '@/store.ts';
 
 export const TYPE_LABEL: Record<PreviewItem['type'], string> = { epic: 'Epic', story: 'Story', task: 'Task', issue: 'Issue' };
 
@@ -29,6 +31,10 @@ export const TONE_CLASS = {
   new: 'border-info-border bg-info-bg text-info',
   applied: 'border-neutral-border bg-neutral-bg text-neutral',
   comments: 'border-info-border bg-info-bg text-info',
+  adopt: 'border-dashed border-neutral-border bg-transparent text-neutral',
+  'remote-edit': 'border-warning-border bg-warning-bg text-warning',
+  'both-edited': 'border-danger-border bg-danger-bg text-danger',
+  unknown: 'border-warning-border bg-warning-bg text-warning',
   neutral: 'border-neutral-border bg-neutral-bg text-neutral',
 } as const;
 export type Tone = keyof typeof TONE_CLASS;
@@ -50,17 +56,50 @@ export function TypeBadge({ type }: { type: PreviewItem['type'] }) {
   );
 }
 
-/** Pushed or new, the review state, and the open comments of an item; `compact` shortens "Đã đổi sau khi duyệt". */
+/** What plan blocks (`PreviewItem.blocked`, `Plan.blocked`): a kind's tone is also its hook class (`.badge.remote.unknown`). */
+export type BlockedKind = NonNullable<PreviewItem['blocked']>['kind'];
+
+/**
+ * How the app names what plan blocks: the snapshot badges and summary (`PreviewItem.blocked`) and the blocked items of
+ * `taigent plan` (exit 6) all take their label from here.
+ */
+export const BLOCKED_LABEL: Record<BlockedKind, { label: string; hint: string }> = {
+  'remote-edit': { label: 'Sửa trên Taiga', hint: 'đã bị sửa trên Taiga sau lần ghi cuối, manifest không đổi' },
+  'both-edited': { label: 'Cả hai cùng sửa', hint: 'cả Taiga và manifest đều đổi, khác nhau' },
+  unknown: { label: 'Khác Taiga', hint: 'khác Taiga và chưa có baseline trong state.json' },
+};
+export const BLOCKED_KINDS = Object.keys(BLOCKED_LABEL) as BlockedKind[];
+
+/**
+ * Where an item stands on Taiga (pushed, to adopt by `ref`, or new), what snapshot.json says plan would block, the
+ * review state, and the open comments of an item; `compact` shortens "Đã đổi sau khi duyệt" and the blocked fields.
+ */
 export function ReviewBadges({ item, compact }: { item: PreviewItem; compact: boolean }) {
+  const readAt = useApp((state) => state.view?.preview.snapshot?.readAt);
   const status = reviewStatus(item);
+  const { blocked } = item;
+  const fields = blocked?.fields.join(', ');
   return (
     <span className="badges inline-flex flex-wrap items-center gap-1">
       {item.applied ? (
         <StatusBadge tone="applied" title={`Đã có trên Taiga (id ${item.applied.id})`}>
           Đã đẩy #{item.applied.ref}
         </StatusBadge>
+      ) : item.adopt ? (
+        <StatusBadge tone="adopt" title={`Mục làm tay #${item.adopt.ref} trên Taiga: lần đẩy tới sẽ adopt nó (gắn tag src:<key>)`}>
+          Adopt #{item.adopt.ref}
+        </StatusBadge>
       ) : (
         <StatusBadge tone="new">Mới</StatusBadge>
+      )}
+      {blocked && (
+        <StatusBadge
+          tone={blocked.kind}
+          className="remote"
+          title={`Theo snapshot lúc ${formatTime(readAt)}: ${BLOCKED_LABEL[blocked.kind].hint} (${fields}). Đẩy lên Taiga sẽ bị chặn cho tới khi backlog.yaml xử lý mục này.`}
+        >
+          {compact ? BLOCKED_LABEL[blocked.kind].label : `${BLOCKED_LABEL[blocked.kind].label}: ${fields}`}
+        </StatusBadge>
       )}
       <StatusBadge tone={status.tone}>{compact && status.tone === 'stale' ? 'Đã đổi' : status.label}</StatusBadge>
       {item.review.openComments > 0 && (
@@ -80,6 +119,10 @@ const TONE_TEXT: Record<Tone, string> = {
   new: 'text-info',
   applied: 'text-foreground',
   comments: 'text-info',
+  adopt: 'text-foreground',
+  'remote-edit': 'text-warning',
+  'both-edited': 'text-destructive',
+  unknown: 'text-warning',
   neutral: 'text-foreground',
 };
 
@@ -90,6 +133,30 @@ export function StatCell({ label, value, tone }: { label: string; value: number 
       <strong className={cn('text-lg font-medium tabular-nums', tone ? TONE_TEXT[tone] : 'text-foreground')}>{value}</strong>
       <span className="text-xs text-muted-foreground">{label}</span>
     </div>
+  );
+}
+
+/**
+ * Where the items stand on Taiga, as stat cells of the Backlog summary and the Thay đổi overview: new, to adopt (shown
+ * when any), pushed and, when `taigent snapshot` wrote snapshot.json, when it read Taiga and how many items plan would
+ * block, by kind (shown when any).
+ */
+export function OriginCells({ view }: { view: ProjectView }) {
+  const s = view.preview.summary;
+  const { snapshot } = view.preview;
+  return (
+    <>
+      <StatCell label="Mới" value={s.new} tone="new" />
+      {s.adopt > 0 && <StatCell label="Adopt" value={s.adopt} tone="adopt" />}
+      <StatCell label="Đã đẩy" value={s.applied} tone="applied" />
+      {snapshot && (
+        <>
+          <Separator orientation="vertical" className="sep h-8" />
+          <StatCell label="Snapshot Taiga" value={formatTime(snapshot.readAt)} />
+          {BLOCKED_KINDS.map((kind) => s.blocked[kind] > 0 && <StatCell key={kind} label={BLOCKED_LABEL[kind].label} value={s.blocked[kind]} tone={kind} />)}
+        </>
+      )}
+    </>
   );
 }
 

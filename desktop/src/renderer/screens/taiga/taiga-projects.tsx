@@ -46,7 +46,7 @@ interface FormState {
 /** What is running: the list read, a project's read (`open:<slug>`), the save or bootstrap. Buttons wait for it. */
 type Busy = 'list' | `open:${string}` | 'save' | 'bootstrap' | undefined;
 
-const NEW_PROJECT: ProjectSettings = { name: '', description: '', template: 'scrum', isPrivate: true, modules: ['epics', 'backlog', 'wiki'] };
+const NEW_PROJECT: ProjectSettings = { name: '', description: '', template: 'scrum', isPrivate: true, modules: ['epics', 'backlog', 'wiki'], existing: false };
 
 function rowState(row: TaigaProjectRow): string {
   if (row.hasBacklog) return 'Có backlog.yaml';
@@ -55,7 +55,8 @@ function rowState(row: TaigaProjectRow): string {
 }
 
 function formFor(found: TaigaProjectDetail): FormState {
-  const fromTaiga = found.taiga ? { ...NEW_PROJECT, name: found.taiga.project.name } : NEW_PROJECT;
+  // The name comes from a project already on Taiga, which may not follow `<A> - <B>`: mark it `existing: true`.
+  const fromTaiga = found.taiga ? { ...NEW_PROJECT, name: found.taiga.project.name, existing: true } : NEW_PROJECT;
   return { slug: found.slug, baseDigest: found.file.digest, settings: found.file.settings ?? fromTaiga, issues: found.file.issues, dirty: false, conflict: false };
 }
 

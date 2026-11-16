@@ -2,7 +2,7 @@
 name: taiga-apply-backlog
 description: "Show the Taiga plan of a backlog manifest, then apply it after you confirm. Carries the BA's edits of taiga/<slug>/preview.md into the manifest first, when that file exists."
 disable-model-invocation: true
-allowed-tools: Bash(npx taigent validate *) Bash(npx taigent preview *) Bash(npx taigent plan *) Bash(npx taigent apply *) PowerShell(npx taigent validate *) PowerShell(npx taigent preview *) PowerShell(npx taigent plan *) PowerShell(npx taigent apply *)
+allowed-tools: Bash(npx taigent validate *) Bash(npx taigent preview *) Bash(npx taigent plan *) Bash(npx taigent apply *) Bash(npx taigent pull *) PowerShell(npx taigent validate *) PowerShell(npx taigent preview *) PowerShell(npx taigent plan *) PowerShell(npx taigent apply *) PowerShell(npx taigent pull *)
 ---
 
 # Taiga apply backlog
@@ -23,7 +23,7 @@ The slug the user named. With exactly one directory under `taiga/`, use it; othe
 
 Skip this step when `taiga/<slug>/preview.md` does not exist.
 
-`preview.md` is the output of `npx taigent preview` that the BA may have edited. `taiga/<slug>/.preview/base.md` is the untouched copy written at the same moment. The manifest stays the source of truth: the BA's edits reach Taiga only by being written into `backlog.yaml` here. Never edit `state.json` (only `apply` writes it) or `project.yaml` (project changes go through `taiga-bootstrap-project`).
+`preview.md` is the output of `npx taigent preview` that the BA may have edited. `taiga/<slug>/.preview/base.md` is the untouched copy written at the same moment. The manifest stays the source of truth: the BA's edits reach Taiga only by being written into `backlog.yaml` here. Never edit `state.json` (only `taigent` commands write it) or `project.yaml` (project changes go through `taiga-bootstrap-project`).
 
 1. No `.preview/base.md`: the BA's edits cannot be told apart from the rest. Say so and ask whether to apply the manifest without them or stop; on stop, end the skill with nothing changed.
 2. Run `npx taigent preview --project <slug> --out taiga/<slug>/.preview/now.md`, then `git diff --no-index --ignore-cr-at-eol -- taiga/<slug>/.preview/base.md taiga/<slug>/.preview/now.md`. Exit 1: the manifest changed after the preview was written (for example `taiga-plan-backlog` answered review comments). Show that diff and ask whether to carry the BA's edits onto the current manifest anyway or stop; on stop, end the skill with nothing changed.
@@ -60,6 +60,7 @@ Run `npx taigent plan --project <slug>`.
 - **Exit 3**: there are changes. Go to step 4.
 - **Exit 0**: Taiga already matches the manifest. Say so and stop.
 - **Exit 4**: the manifest breaks a convention. Show the problems, suggest `taiga-plan-backlog` (`/taiga-plan-backlog`, Codex `$taiga-plan-backlog`) to fix them, and stop.
+- **Exit 6**: some items are blocked (`remote-edit`, `both-edited` or `unknown`). Never run `apply --yes` while plan has blocked items. Show the `blocked` list (`npx taigent plan --project <slug> --json`: each item's `kind` and `fields`) and settle every item with the user exactly as step 3 of `taiga-plan-backlog` (Settle blocked items) says, with `npx taigent pull`; a story rewritten after a pull parse failure goes back to review instead of being applied. Then return to step 3.
 - **Exit 2 or 5**: show the error (missing variable, login refused, unknown project, Taiga unreachable) and stop. For a missing `TAIGA_*` variable or a refused login, name `taiga-setup` as the fix; for an unknown project, `taiga-bootstrap-project`.
 
 ## 4. Show the plan and ask
@@ -79,6 +80,7 @@ After the confirmation:
 
 Done when apply exits 0.
 
+- **Exit 6, blocked**: an item was changed on Taiga after the plan; nothing was written. Settle it as in step 3 and return to step 3.
 - **Exit 5, conflict**: an item changed on Taiga during apply; nothing was overwritten. Show the message and return to step 3.
 - **Other exit 5**: show the message. Apply resumes where it stopped, so the user can re-run this skill once the cause is fixed.
 

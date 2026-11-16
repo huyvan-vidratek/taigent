@@ -10,7 +10,7 @@ import type { ProjectSettings, ProjectSettingsFile, SaveProjectSettingsResult } 
 import type { MetricsReport } from '../../../src/metrics/compute.ts';
 import type { DeveloperItem, MedianDays, WorkloadRow } from '../../../src/metrics/developer.ts';
 import type { Period } from '../../../src/metrics/periods.ts';
-import type { StaleLink } from '../../../src/planner.ts';
+import type { BlockedItem, StaleLink } from '../../../src/planner.ts';
 import type { ProjectDetailReport, StoryStatusEntry } from '../../../src/projects.ts';
 import type { Preview, PreviewEpic, PreviewIssue, PreviewItem, PreviewStory, PreviewSummary, ReviewComment, Verdict } from '../../../src/review.ts';
 import type { CommentAdded, StatusChange } from '../../../src/ticket.ts';
@@ -92,7 +92,7 @@ export interface LoginInput {
 }
 
 export interface PlanOperation {
-  action: 'create' | 'update' | 'link' | 'skip';
+  action: 'create' | 'update' | 'adopt' | 'link' | 'skip';
   type: string;
   key: string;
   id?: number;
@@ -106,20 +106,25 @@ export interface PlanOperation {
 export interface Plan {
   project: { id: number; slug: string };
   changes: boolean;
-  summary: { create: number; update: number; link: number; skip: number };
+  summary: { create: number; update: number; adopt: number; link: number; skip: number };
   operations: PlanOperation[];
   orphans: { type: string; key: string; id: number; ref: number; subject: string }[];
   staleLinks: StaleLink[];
+  /** Items apply refuses to touch until settled (`docs/cli.md` §Baseline and remote edits); plan exits 6 when any. */
+  blocked: BlockedItem[];
+  handMadeChildren: { type: string; id: number; ref: number; subject: string; parent: string }[];
 }
 
 export interface ApplyReport {
   project: { id: number; slug: string };
   operations: { action: string; type: string; key: string; id: number; ref: number; epic?: string; result: string }[];
-  summary: { created: number; updated: number; linked: number; unchanged: number };
+  summary: { created: number; updated: number; adopted: number; linked: number; unchanged: number };
 }
 
 export type ApplyOutcome =
   | { status: 'blocked'; reasons: string[] }
+  /** `plan` exited 6: items blocked on Taiga; nothing was asked or written. */
+  | { status: 'plan-blocked'; plan: Plan }
   | { status: 'no-changes'; plan: Plan }
   | { status: 'cancelled' }
   | { status: 'applied'; report: ApplyReport };

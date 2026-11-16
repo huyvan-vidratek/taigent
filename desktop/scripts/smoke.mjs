@@ -11,7 +11,7 @@
 //
 //   node scripts/smoke.mjs [--project <slug> --story <key>] [--exe <packaged app exe>] [--out <screenshot dir>]
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -219,6 +219,7 @@ try {
     await storyFormScenario(page);
     await issueFormScenario(page);
     await wikiScenario(page);
+    await snapshotBadgeScenario(page);
     await staleLinkScenario(page);
   }
 
@@ -293,6 +294,7 @@ try {
   } else {
     log('skipped bootstrap: not logged in');
   }
+  await existingProjectScenario(page);
 
   // The sprint and epic tables (`productOwner.report`) moved to the Product Owner dashboard (smoke-dashboard-po.mjs).
   const cards = await page.locator('#screen-taiga [data-slot="card"]').evaluateAll((items) => items.map((item) => item.id));
@@ -505,20 +507,33 @@ async function wikiScenario(page) {
 }
 
 /**
- * Thay đổi › "Xem thay đổi trên Taiga" against a fake Taiga where story REVIEW-MARKDOWN is still linked to an old
- * taigent epic: the screen lists that stale link (and the old epic as an orphan) next to the changes.
+ * Thay đổi › "Xem thay đổi trên Taiga" against a fake Taiga. The backlog is first applied to it with the CLI, so every
+ * item has a baseline in state.json (else plan blocks them as `unknown`). Then story REVIEW-MARKDOWN is also linked to
+ * an old taigent epic: the screen lists that stale link (and the old epic as an orphan) next to the changes. Last, the
+ * story is edited on Taiga: plan exits 6 and the screen lists it as a blocked item. state.json is put back afterwards.
  */
 async function staleLinkScenario(page) {
   const { startFakeTaiga } = await import(pathToFileURL(join(repo, 'test', 'support', 'fake-taiga.ts')).href);
   const fake = await startFakeTaiga();
-  const before = await setMainEnv(app, { TAIGA_API_URL: fake.url, TAIGA_USERNAME: fake.user.username, TAIGA_PASSWORD: fake.user.password, TAIGA_TOKEN: null });
+  const credentials = { TAIGA_API_URL: fake.url, TAIGA_USERNAME: fake.user.username, TAIGA_PASSWORD: fake.user.password, TAIGA_TOKEN: null };
+  const before = await setMainEnv(app, credentials);
+  const stateFile = join(manifests, project, 'state.json');
+  const recorded = await readFile(stateFile, 'utf8');
   try {
     const remote = fake.addProject({ slug: project });
     // The epic form step filled this attribute of project.yaml: plan needs the project to define it.
     fake.addCustomAttribute({ itemType: 'epic', project: remote.id, name: 'Mục tiêu quý' });
+    // The fixture's state.json names items of another Taiga: start from none, then apply records every baseline.
+    await writeFile(stateFile, JSON.stringify({ items: {} }));
+    const applied = await taigentAsync(credentials, 'apply', '--project', project, '--yes', '--json');
+    check(applied.status === 0, `taigent apply seeds the fake Taiga and the baselines (exit ${applied.status}: ${applied.stderr.trim()})`);
+    const markdownId = JSON.parse(await readFile(stateFile, 'utf8')).items['REVIEW-MARKDOWN']?.id;
+    const markdown = fake.state.userStories.find((candidate) => candidate.id === markdownId);
+    check(markdown?.tags.includes('src:review-markdown'), 'apply created story REVIEW-MARKDOWN and state.json records it');
     const old = fake.addEpic({ project: remote.id, subject: 'Epic cũ', tags: ['src:old-review'] });
-    const markdown = fake.addUserStory({ project: remote.id, subject: 'Mô tả hiển thị Markdown', tags: ['src:review-markdown'] });
     fake.addEpicRelatedUserStory(old.id, markdown.id);
+    const seeded = fake.requests.length;
+
     await goTo(page, 'changes');
     await page.click('#plan-btn');
     await page.waitForSelector('#changes-result h2', { timeout: 120_000 });
@@ -529,18 +544,119 @@ async function staleLinkScenario(page) {
       `Thay đổi lists the stale link of REVIEW-MARKDOWN to the old epic, which apply never removes${stale ? '' : ` (screen: ${result})`}`,
     );
     check(result?.includes('OLD-REVIEW – Epic cũ'), 'the old epic is listed as an orphan');
-    check(fake.requests.every((request) => request.method === 'GET' || request.path === '/auth'), 'plan writes nothing to Taiga');
+    check(!(await page.isVisible('#plan-blocked')), `with the baselines of apply, nothing is blocked (screen: ${result})`);
     await page.screenshot({ path: join(shots, '9b-plan-stale-link.png') });
+
+    // Edited on Taiga since apply: plan exits 6, and the plan still shows, with the blocked item.
+    fake.editItem(markdown, { subject: 'Sửa trên Taiga giả' });
+    await page.click('#plan-btn');
+    await page.waitForSelector('#plan-blocked', { timeout: 120_000 });
+    const title = await page.textContent('#changes-result h2');
+    const blocked = await page.textContent('#plan-blocked');
+    check(title?.includes('bị chặn'), `an exit-6 plan is shown as a plan with blocked items, not as a failure (${title})`);
+    check(
+      blocked?.includes('Sửa trên Taiga') && blocked.includes(`#${markdown.ref}`) && blocked.includes('REVIEW-MARKDOWN') && blocked.includes('subject'),
+      `the blocked item names its kind, ref, key and fields (${blocked})`,
+    );
+    check(fake.requests.slice(seeded).every((request) => request.method === 'GET' || request.path === '/auth'), 'plan writes nothing to Taiga');
+    await page.screenshot({ path: join(shots, '9c-plan-blocked.png') });
   } finally {
     await setMainEnv(app, before);
     await fake.close();
+    await writeFile(stateFile, recorded);
   }
   await goTo(page, 'backlog');
+}
+
+/**
+ * Badges of the preview (#61): an issue with a `ref` that state.json does not record yet shows "Adopt #ref"; once a
+ * snapshot.json holds epic REVIEW with another subject (state.json has no baseline for it), the epic shows "Khác Taiga"
+ * and the summary dates the snapshot. Without snapshot.json no such badge shows. Both files are put back afterwards.
+ */
+async function snapshotBadgeScenario(page) {
+  const issue = 'BUG-STALE-AFTER-RENAME';
+  const snapshotFile = join(manifests, project, 'snapshot.json');
+  const backlog = await readFile(backlogFile, 'utf8');
+  // A Windows checkout (core.autocrlf) has CRLF line endings.
+  const adopting = backlog.replace(new RegExp(`( *)- key: ${issue}(\\r?\\n)`), `$1- key: ${issue}$2$1  ref: 99$2`);
+  check(adopting !== backlog, `backlog.yaml declares issue ${issue}`);
+  await writeFile(backlogFile, adopting);
+  await page.waitForSelector(`#tree .node[data-key="${issue}"] .badge.adopt`, { timeout: 10_000 });
+  check((await page.textContent(`#tree .node[data-key="${issue}"] .badge.adopt`)) === 'Adopt #99', `issue ${issue} with ref 99 is labelled Adopt #99`);
+  check((await page.locator('#tree .badge.remote').count()) === 0, 'no remote badge without snapshot.json');
+
+  const epic = { id: 1, ref: 1, version: 1, subject: 'Epic đã sửa trên Taiga', status: 'New', closed: false, tags: ['src:review'], key: 'REVIEW', description: '' };
+  await writeFile(snapshotFile, JSON.stringify({ project: { id: 1, slug: project }, readAt: new Date().toISOString(), epics: [epic], stories: [], tasks: [], issues: [] }));
+  await page.waitForSelector('#tree .node[data-key="REVIEW"] .badge.remote.unknown', { timeout: 10_000 });
+  check((await page.textContent('#tree .node[data-key="REVIEW"] .badge.remote')) === 'Khác Taiga', 'epic REVIEW is labelled Khác Taiga from snapshot.json');
+  check((await page.textContent('#summary'))?.includes('Snapshot Taiga'), 'the summary dates the snapshot');
+  await page.screenshot({ path: join(shots, '9d-snapshot-badges.png') });
+
+  await rm(snapshotFile);
+  await writeFile(backlogFile, backlog);
+  await page.waitForFunction(() => document.querySelectorAll('#tree .badge.remote, #tree .badge.adopt').length === 0, undefined, { timeout: 10_000 });
+  log('ok - the badges go once snapshot.json and the ref are gone');
+}
+
+/**
+ * Taiga > Project (#55): a project already on Taiga, without a manifest directory, opens in the form with its Taiga
+ * name, which need not follow `<A> - <B>`; saving writes project.yaml with `existing: true`. The directory goes after.
+ */
+async function existingProjectScenario(page) {
+  const { startFakeTaiga } = await import(pathToFileURL(join(repo, 'test', 'support', 'fake-taiga.ts')).href);
+  const fake = await startFakeTaiga();
+  const before = await setMainEnv(app, { TAIGA_API_URL: fake.url, TAIGA_USERNAME: fake.user.username, TAIGA_PASSWORD: fake.user.password, TAIGA_TOKEN: null });
+  const slug = 'legacy-crm';
+  const name = 'CRM cũ làm tay';
+  const projectFile = join(manifests, slug, 'project.yaml');
+  try {
+    fake.addProject({ slug, name });
+    await page.click('#taiga-projects-refresh');
+    await page.waitForSelector(`#taiga-projects-list [data-open="${slug}"]`, { timeout: 60_000 });
+    await page.click(`#taiga-projects-list [data-open="${slug}"]`);
+    await page.waitForFunction((expected) => document.querySelector('#pf-name')?.value === expected, name, { timeout: 30_000 });
+    check((await page.textContent('#pf-slug')) === slug, `the form of Taiga project ${slug} shows its slug`);
+    // Taiga requires a description; the name stays as Taiga has it.
+    await page.fill('#pf-description', 'CRM làm tay trên Taiga trước taigent');
+    await page.click('#pf-save');
+    let saved = '';
+    for (let attempt = 0; attempt < 100 && !saved.includes('existing:'); attempt++) {
+      saved = await readFile(projectFile, 'utf8').catch(() => '');
+      if (!saved.includes('existing:')) await new Promise((done) => setTimeout(done, 100));
+    }
+    check(/^existing: true$/m.test(saved) && saved.includes(name), `project.yaml of a project taken from Taiga has its name and existing: true (${saved.trim()})`);
+    check(!(await page.isVisible('#pf-issues')), 'the Taiga name of an existing project raises no naming issue');
+    await page.screenshot({ path: join(shots, '10b-project-existing.png') });
+  } finally {
+    await setMainEnv(app, before);
+    await fake.close();
+    await rm(join(manifests, slug), { recursive: true, force: true });
+  }
+  await page.click('#taiga-projects-refresh');
+  await page.waitForSelector(`#taiga-projects-list [data-open="${slug}"]`, { state: 'detached', timeout: 60_000 }).catch(() => undefined);
 }
 
 /** Runs the taigent CLI of this repository on the temporary manifests (offline commands only). */
 function taigent(...args) {
   return spawnSync(process.execPath, [join(repo, 'bin', 'taigent.js'), ...args], { cwd: work, env: { ...process.env, TAIGENT_MANIFESTS_DIR: manifests }, encoding: 'utf8' });
+}
+
+/** Runs the taigent CLI on the temporary manifests with `env` on top, without blocking the in-process fake Taiga. */
+function taigentAsync(env, ...args) {
+  const merged = { ...process.env, TAIGENT_MANIFESTS_DIR: manifests };
+  for (const [name, value] of Object.entries(env)) {
+    if (value === null) delete merged[name];
+    else merged[name] = value;
+  }
+  return new Promise((done, reject) => {
+    const child = spawn(process.execPath, [join(repo, 'bin', 'taigent.js'), ...args], { cwd: work, env: merged });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk) => (stdout += chunk));
+    child.stderr.setEncoding('utf8').on('data', (chunk) => (stderr += chunk));
+    child.on('error', reject);
+    child.on('close', (status) => done({ status, stdout, stderr }));
+  });
 }
 
 /** The story `key` as backlog.yaml holds it now. */

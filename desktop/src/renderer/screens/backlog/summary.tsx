@@ -1,8 +1,9 @@
-// The Backlog summary of the open project: item counts, pushed or new, the review progress and its states, and whether
-// the manifest validates (an invalid one opens its issues in the result dialog).
+// The Backlog summary of the open project: item counts, where they stand on Taiga (new, to adopt, pushed, and what
+// snapshot.json says plan would block), the review progress and its states, and whether the manifest validates (an
+// invalid one opens its issues in the result dialog).
 
 import { showResult } from '@/actions.ts';
-import { StatCell, StatusBadge, TONE_CLASS } from '@/components/common.tsx';
+import { OriginCells, StatCell, StatusBadge, TONE_CLASS } from '@/components/common.tsx';
 import { Button } from '@/components/ui/button.tsx';
 import { Separator } from '@/components/ui/separator.tsx';
 import { cn } from '@/lib/utils.ts';
@@ -28,8 +29,7 @@ export function BacklogSummary() {
       <StatCell label="Task" value={s.tasks} />
       <StatCell label="Issue" value={s.issues} />
       <Separator orientation="vertical" className="h-8" />
-      <StatCell label="Mới" value={s.new} tone="new" />
-      <StatCell label="Đã đẩy" value={s.applied} tone="applied" />
+      <OriginCells view={view} />
       <Separator orientation="vertical" className="h-8" />
       <div className="review-meter flex w-40 flex-col gap-1" role="img" aria-label={`${s.approved} trên ${reviewable} mục đạt`}>
         <span className="review-meter-label text-xs text-muted-foreground">
